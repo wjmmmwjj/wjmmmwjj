@@ -1,0 +1,7 @@
+ccxt>=4.0.0
+requests>=2.25.0
+mplfinance>=0.12.9b7
+discord.py>=2.0.0
+numpy>=1.20.0
+pandas>=1.2.0
+matplotlib>=3.3.0
