@@ -7,6 +7,7 @@ import time
 import json
 import random
 import discord
+import asyncio
 from discord.ext import tasks
 import os
 import pandas as pd
@@ -14,7 +15,29 @@ from discord.ext import commands
 from config import BITUNIX_API_KEY, BITUNIX_SECRET_KEY, DISCORD_WEBHOOK_URL, STOP_MULT, LIMIT_MULT, RSI_BUY, RSI_LEN, EXIT_RSI, BREAKOUT_LOOKBACK, ATR_LEN, ATR_MULT, TIMEFRAME, LEVERAGE, TRADING_PAIR, SYMBOL, MARGIN_COIN, LOOP_INTERVAL_SECONDS, QUANTITY_PRECISION
 from config import rsiSell, exitRSI_short, CONDITIONAL_ORDER_MAX_RETRIES, CONDITIONAL_ORDER_RETRY_INTERVAL
 import threading
+import re
+import logging
+import sys
+from config import DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID
+import traceback
 
+# 設定 logging，寫入 log.txt
+logging.basicConfig(
+    filename='log.txt',
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    encoding='utf-8'
+)
+logger = logging.getLogger(__name__)
+
+# 全域未捕捉異常也寫入日誌
+def log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = log_uncaught_exception
 
 # === 全域變數與統計檔案設定 ===
 STATS_FILE = os.path.join(os.path.dirname(__file__), "stats.json")
@@ -26,10 +49,24 @@ current_pos_entry_type = None # 記錄持倉的進場信號類型 ('rsi' 或 'br
 current_stop_loss_price = None # 記錄當前持倉的止損價格
 current_position_id_global = None # 記錄當前持倉的 positionId
 last_checked_kline_time = None  # 新增：記錄上一次檢查的K棒時間
+# === 新增：記錄開倉價 ===
+current_entry_price_long = None
+current_entry_price_short = None
 
 # === 新增：本地已通知平倉單ID記錄 ===
 NOTIFIED_ORDERS_FILE = os.path.join(os.path.dirname(__file__), "notified_orders.json")
 notified_orders_lock = threading.Lock()
+
+POSITION_ENTRY_TYPE_FILE = "position_entry_type.json"
+try:
+    with open(POSITION_ENTRY_TYPE_FILE, "r", encoding="utf-8") as f:
+        position_entry_type_map = json.load(f)
+except Exception:
+    position_entry_type_map = {}
+
+def save_position_entry_type_map():
+    with open(POSITION_ENTRY_TYPE_FILE, "w", encoding="utf-8") as f:
+        json.dump(position_entry_type_map, f)
 
 def load_stats():
     global win_count, loss_count
@@ -147,9 +184,34 @@ def get_signed_params(api_key, secret_key, query_params: dict = None, body: dict
 
 # === 日誌紀錄函數 ===
 def log_event(event_type, message):
+    import re
     log_file = os.path.join(os.path.dirname(__file__), "log.txt")
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{event_type}] {message}\n")
+    if event_type == "RSI多單動態止損/止盈調整":
+        # 從 message 取出 positionId
+        match = re.search(r"positionId=([0-9]+)", message)
+        if match:
+            position_id = match.group(1)
+            # 讀取所有行
+            try:
+                with open(log_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+            # 過濾掉同 event_type 且同 positionId 的舊紀錄
+            pattern = re.compile(r"\[RSI多單動態止損/止盈調整\].*positionId=" + position_id)
+            lines = [line for line in lines if not pattern.search(line)]
+            # 加入新紀錄
+            lines.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{event_type}] {message}\n")
+            # 寫回檔案
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        else:
+            # 若沒抓到 positionId，則直接追加
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{event_type}] {message}\n")
+    else:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{event_type}] {message}\n")
 
 def send_order(api_key, secret_key, symbol, margin_coin, side, size, leverage=LEVERAGE, position_id=None):
     # 直接下單，不再自動設置槓桿/槓桿
@@ -449,9 +511,21 @@ def send_discord_message(core_message, api_key=None, secret_key=None, operation_
     current_pos_status_for_discord = ""
     current_pos_pnl_msg = ""
     if api_key and secret_key:
-        actual_pos_side, actual_pos_qty_str, _, actual_unrealized_pnl = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
-        if actual_pos_side in ["long", "short"] and actual_unrealized_pnl is not None:
-            current_pos_pnl_msg = f"{actual_unrealized_pnl:.4f} USDT"
+        pos_info = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
+        long_pos = pos_info["long"]
+        short_pos = pos_info["short"]
+        # 優先顯示多單，若無多單則顯示空單，否則顯示無持倉
+        if long_pos is not None:
+            current_pos_status_for_discord = f"📈 多單 (數量: {long_pos['qty']})"
+            if long_pos.get("unrealized_pnl") is not None:
+                current_pos_pnl_msg = f"{long_pos['unrealized_pnl']:.4f} USDT"
+        elif short_pos is not None:
+            current_pos_status_for_discord = f"📉 空單 (數量: {short_pos['qty']})"
+            if short_pos.get("unrealized_pnl") is not None:
+                current_pos_pnl_msg = f"{short_pos['unrealized_pnl']:.4f} USDT"
+        else:
+            current_pos_status_for_discord = "🔄 無持倉"
+            current_pos_pnl_msg = ""
     if operation_details:
         op_type = operation_details.get("type")
         if op_type == "close_success":
@@ -485,11 +559,13 @@ def send_discord_message(core_message, api_key=None, secret_key=None, operation_
     # 決定最終的持倉狀態顯示
     if not (operation_details and operation_details.get("type") == "close_success"):
         if api_key and secret_key:
-            actual_pos_side, actual_pos_qty_str, _, _ = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
-            if actual_pos_side == "long":
-                current_pos_status_for_discord = f"📈 多單 (數量: {actual_pos_qty_str})"
-            elif actual_pos_side == "short":
-                current_pos_status_for_discord = f"📉 空單 (數量: {actual_pos_qty_str})"
+            pos_info = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
+            long_pos = pos_info["long"]
+            short_pos = pos_info["short"]
+            if long_pos is not None:
+                current_pos_status_for_discord = f"📈 多單 (數量: {long_pos['qty']})"
+            elif short_pos is not None:
+                current_pos_status_for_discord = f"📉 空單 (數量: {short_pos['qty']})"
             else:
                 current_pos_status_for_discord = "🔄 無持倉"
     # 構造 Discord Embed
@@ -587,6 +663,10 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
     global last_checked_kline_time
     print(f"執行交易策略: {symbol}")
 
+    # 新增：記錄本K棒是否已經有多單平倉行為
+    if not hasattr(execute_trading_strategy, "long_action_taken_on_kline_time"):
+        execute_trading_strategy.long_action_taken_on_kline_time = {}
+
     try:
         ohlcv_data = fetch_ohlcv(api_key, secret_key)
         df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -608,14 +688,39 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
         else:
             print("RSI: 無法取得")
 
+        # 檢查是否新K棒，若是則重置
+        if (last_checked_kline_time is None) or (latest_kline_time != last_checked_kline_time):
+            execute_trading_strategy.long_action_taken_on_kline_time[latest_kline_time] = False
+            last_checked_kline_time = latest_kline_time
+
         # 檢查當前持倉狀態
-        current_pos_side, current_pos_qty_str, current_position_id, current_unrealized_pnl = get_current_position_details(api_key, secret_key, symbol, margin_coin)
+        pos_info = get_current_position_details(api_key, secret_key, symbol, margin_coin)
+        long_pos = pos_info["long"]
+        short_pos = pos_info["short"]
+        # 多單資訊
+        if long_pos is not None:
+            current_pos_side = "long"
+            current_pos_qty_str = long_pos["qty"]
+            current_position_id = long_pos["positionId"]
+            current_unrealized_pnl = long_pos["unrealized_pnl"]
+        elif short_pos is not None:
+            current_pos_side = "short"
+            current_pos_qty_str = short_pos["qty"]
+            current_position_id = short_pos["positionId"]
+            current_unrealized_pnl = short_pos["unrealized_pnl"]
+        else:
+            current_pos_side = None
+            current_pos_qty_str = None
+            current_position_id = None
+            current_unrealized_pnl = None
         current_pos_qty = float(current_pos_qty_str) if current_pos_qty_str else 0.0
 
         # 只允許同時一張單
         if current_pos_side is None:
+            # 若本K棒已經有多單平倉行為，則禁止RSI多單開倉
+            rsi_long_blocked = execute_trading_strategy.long_action_taken_on_kline_time.get(latest_kline_time, False)
             # RSI 多單進場
-            if latest_rsi is not None and latest_rsi < RSI_BUY:
+            if not rsi_long_blocked and latest_rsi is not None and latest_rsi < RSI_BUY:
                 trade_size = calculate_trade_size(api_key, secret_key, symbol, wallet_percentage, leverage, latest_close)
                 if trade_size > 0:
                     log_event("策略判斷", f"觸發RSI多單條件，RSI={latest_rsi:.2f} < {RSI_BUY}")
@@ -629,8 +734,22 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                             new_position_id = get_position_id_by_order_id(api_key, secret_key, symbol, order_id)
                         current_position_id_global = new_position_id
                         current_pos_entry_type = "rsi"
-                        stop_loss = latest_close - latest_atr * STOP_MULT
-                        take_profit = latest_close + latest_atr * LIMIT_MULT
+                        position_entry_type_map[str(new_position_id)] = "RSI"
+                        save_position_entry_type_map()
+                        # 在 execute_trading_strategy() 新開倉時，開倉後自動查詢並記錄開倉價
+                        # 新開倉多單
+                        pos_info = get_current_position_details(api_key, secret_key, symbol, margin_coin)
+                        long_pos = pos_info["long"]
+                        if long_pos is not None:
+                            current_entry_price_long = long_pos.get("avgOpenPrice")
+                        # 止損止盈計算改用 current_entry_price_long
+                        if current_entry_price_long is not None:
+                            stop_loss = current_entry_price_long - latest_atr * STOP_MULT
+                            take_profit = current_entry_price_long + latest_atr * LIMIT_MULT
+                        else:
+                            log_event("止損止盈錯誤", "無法取得多單開倉價，跳過止損止盈計算")
+                            stop_loss = None
+                            take_profit = None
                         if new_position_id:
                             place_conditional_orders(api_key, secret_key, symbol, margin_coin, new_position_id, stop_price=stop_loss, limit_price=take_profit)
                         else:
@@ -643,7 +762,9 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                         send_discord_message("🔴 **RSI 多單開倉失敗** 🔴", api_key, secret_key, operation_details={"type": "error", "details": order_result.get("msg", order_result.get("error", "未知錯誤")), "signal": "RSI", "force_send": True})
                 else:
                     log_event("策略判斷", f"RSI多單條件成立但下單數量為0，RSI={latest_rsi:.2f}")
-            # Breakout 多單進場
+            elif rsi_long_blocked and latest_rsi is not None and latest_rsi < RSI_BUY:
+                print("本K棒已多單平倉，禁止RSI多單開倉")
+            # Breakout 多單進場（不受限制）
             elif latest_highest_break is not None and latest_close > latest_highest_break:
                 trade_size = calculate_trade_size(api_key, secret_key, symbol, wallet_percentage, leverage, latest_close)
                 if trade_size > 0:
@@ -653,6 +774,8 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                         new_position_id = order_result.get("data", {}).get("positionId")
                         current_position_id_global = new_position_id
                         current_pos_entry_type = "breakout"
+                        position_entry_type_map[str(new_position_id)] = "Breakout"
+                        save_position_entry_type_map()
                         current_stop_loss_price = latest_close - latest_atr * ATR_MULT
                         log_event("開倉成功", f"多單 Breakout, 數量={trade_size}, 價格={latest_close}, 初始移動止損={current_stop_loss_price}")
                         send_discord_message("🟢 **突破多單開倉成功** 🟢", api_key, secret_key, operation_details={"type": "open_success", "side_opened": "long", "qty": trade_size, "entry_price": latest_close, "signal": "Breakout", "force_send": True})
@@ -661,7 +784,7 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                         send_discord_message("🔴 **突破多單開倉失敗** 🔴", api_key, secret_key, operation_details={"type": "error", "details": order_result.get("msg", order_result.get("error", "未知錯誤")), "signal": "Breakout", "force_send": True})
                 else:
                     log_event("策略判斷", f"突破多單條件成立但下單數量為0，close={latest_close}")
-            # RSI 空單進場
+            # 空單進場不受限制
             elif latest_rsi is not None and latest_rsi > rsiSell:
                 trade_size = calculate_trade_size(api_key, secret_key, symbol, wallet_percentage, leverage, latest_close)
                 if trade_size > 0:
@@ -676,8 +799,21 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                         if new_position_id:
                             current_position_id_global = new_position_id
                             current_pos_entry_type = "rsi_short"
-                            stop_loss = latest_close + latest_atr * STOP_MULT
-                            take_profit = latest_close - latest_atr * LIMIT_MULT
+                            position_entry_type_map[str(new_position_id)] = "RSI"
+                            save_position_entry_type_map()
+                            # 在 execute_trading_strategy() 新開倉時，開倉後自動查詢並記錄開倉價
+                            # 新開倉空單
+                            pos_info = get_current_position_details(api_key, secret_key, symbol, margin_coin)
+                            short_pos = pos_info["short"]
+                            if short_pos is not None:
+                                current_entry_price_short = short_pos.get("avgOpenPrice")
+                            if current_entry_price_short is not None:
+                                stop_loss = current_entry_price_short + latest_atr * STOP_MULT
+                                take_profit = current_entry_price_short - latest_atr * LIMIT_MULT
+                            else:
+                                log_event("止損止盈錯誤", "無法取得空單開倉價，跳過止損止盈計算")
+                                stop_loss = None
+                                take_profit = None
                             place_conditional_orders(api_key, secret_key, symbol, margin_coin, new_position_id, stop_price=stop_loss, limit_price=take_profit)
                             current_stop_loss_price = stop_loss
                             log_event("開倉成功", f"空單 RSI, 數量={trade_size}, 價格={latest_close}, 止損={stop_loss}, 止盈={take_profit}")
@@ -690,7 +826,6 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                         send_discord_message("🔴 **RSI 空單開倉失敗** 🔴", api_key, secret_key, operation_details={"type": "error", "details": order_result.get("msg", order_result.get("error", "未知錯誤")), "signal": "RSI 空", "force_send": True})
                 else:
                     log_event("策略判斷", f"RSI空單條件成立但下單數量為0，RSI={latest_rsi:.2f}")
-            # Breakout 空單進場
             elif lowest_break is not None and latest_close < lowest_break:
                 trade_size = calculate_trade_size(api_key, secret_key, symbol, wallet_percentage, leverage, latest_close)
                 if trade_size > 0:
@@ -704,6 +839,8 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                         if new_position_id:
                             current_position_id_global = new_position_id
                             current_pos_entry_type = "breakout_short"
+                            position_entry_type_map[str(new_position_id)] = "Breakout"
+                            save_position_entry_type_map()
                             current_stop_loss_price = latest_close + latest_atr * ATR_MULT
                             log_event("開倉成功", f"空單 Breakout, 數量={trade_size}, 價格={latest_close}, 初始移動止損={current_stop_loss_price}")
                             send_discord_message("🟢 **突破空單開倉成功** 🟢", api_key, secret_key, operation_details={"type": "open_success", "side_opened": "short", "qty": trade_size, "entry_price": latest_close, "signal": "Breakout 空", "force_send": True})
@@ -782,6 +919,12 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                             current_pos_entry_type = None
                             current_stop_loss_price = None
                             current_position_id_global = None
+                            # 標記本K棒已多單平倉
+                            execute_trading_strategy.long_action_taken_on_kline_time[latest_kline_time] = True
+                            save_long_action_flag(execute_trading_strategy.long_action_taken_on_kline_time)
+                            if current_position_id:
+                                position_entry_type_map.pop(str(current_position_id), None)
+                                save_position_entry_type_map()
                         else:
                             log_event("平倉失敗", f"多單 RSI, 數量={current_pos_qty}, 價格={latest_close}, 錯誤={order_result}")
                             send_discord_message("🔴 **RSI 多單平倉失敗** 🔴", api_key, secret_key, operation_details={"type": "error", "details": order_result.get("msg", order_result.get("error", "未知錯誤")), "force_send": True})
@@ -850,6 +993,9 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                             current_pos_entry_type = None
                             current_stop_loss_price = None
                             current_position_id_global = None
+                            if current_position_id:
+                                position_entry_type_map.pop(str(current_position_id), None)
+                                save_position_entry_type_map()
                         else:
                             log_event("平倉失敗", f"空單 RSI, 數量={current_pos_qty}, 價格={latest_close}, 錯誤={order_result}")
                             send_discord_message("🔴 **RSI 空單平倉失敗** 🔴", api_key, secret_key, operation_details={"type": "error", "details": order_result.get("msg", order_result.get("error", "未知錯誤")), "force_send": True})
@@ -860,7 +1006,7 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
             if current_stop_loss_price is not None and new_trailing_stop > current_stop_loss_price:
                 modify_result = modify_position_tpsl(api_key, secret_key, symbol, current_position_id_global, stop_price=new_trailing_stop)
                 if modify_result and modify_result.get('code') == 0:
-                    log_event("移動止損調整", f"多單 Breakout, positionId={current_position_id_global}, 新止損={new_trailing_stop}")
+                    log_event("移動止損調整", f"多單 Breakout, positionId={current_position_id_global}, 新止損={new_trailing_stop}, ATR={latest_atr}, RSI={latest_rsi}")
                     current_stop_loss_price = new_trailing_stop
                     send_discord_message(f"⬆️ **突破多單移動止損上調** ⬆️ 新止損: {new_trailing_stop:.4f}", api_key, secret_key, operation_details={"type": "status_update", "details": f"新止損: {new_trailing_stop:.4f}", "force_send": True})
                 else:
@@ -872,7 +1018,7 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
             if current_stop_loss_price is not None and new_trailing_stop < current_stop_loss_price:
                 modify_result = modify_position_tpsl(api_key, secret_key, symbol, current_position_id_global, stop_price=new_trailing_stop)
                 if modify_result and modify_result.get('code') == 0:
-                    log_event("移動止損調整", f"空單 Breakout, positionId={current_position_id_global}, 新止損={new_trailing_stop}")
+                    log_event("移動止損調整", f"空單 Breakout, positionId={current_position_id_global}, 新止損={new_trailing_stop}, ATR={latest_atr}, RSI={latest_rsi}")
                     current_stop_loss_price = new_trailing_stop
                     send_discord_message(f"⬇️ **突破空單移動止損下調** ⬇️ 新止損: {new_trailing_stop:.4f}", api_key, secret_key, operation_details={"type": "status_update", "details": f"新止損: {new_trailing_stop:.4f}", "force_send": True})
                 else:
@@ -881,8 +1027,13 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
 
         # RSI 多單動態止盈止損自動更新（先查詢、取消、再設置）
         if current_pos_side == "long" and current_pos_entry_type == "rsi" and current_position_id_global:
-            new_stop_loss = latest_close - latest_atr * STOP_MULT
-            new_take_profit = latest_close + latest_atr * LIMIT_MULT
+            if current_entry_price_long is not None:
+                new_stop_loss = current_entry_price_long - latest_atr * STOP_MULT
+                new_take_profit = current_entry_price_long + latest_atr * LIMIT_MULT
+            else:
+                log_event("止損止盈錯誤", "無法取得多單開倉價，跳過動態止損止盈計算")
+                new_stop_loss = None
+                new_take_profit = None
             # 僅當止損或止盈價格有變動才更新
             if (current_stop_loss_price is None or abs(new_stop_loss - current_stop_loss_price) > 1e-6):
                 tpsl_order_ids = get_pending_tpsl_orders(api_key, secret_key, symbol, current_position_id_global)
@@ -890,22 +1041,27 @@ def execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_pe
                     cancel_tpsl_order(api_key, secret_key, symbol, oid)
                 place_result = place_conditional_orders(api_key, secret_key, symbol, margin_coin, current_position_id_global, stop_price=new_stop_loss, limit_price=new_take_profit)
                 if place_result and place_result.get('code') == 0:
-                    log_event("RSI多單動態止損/止盈調整", f"多單 RSI, positionId={current_position_id_global}, 新止損={new_stop_loss}, 新止盈={new_take_profit}")
+                    log_event("RSI多單動態止損/止盈調整", f"多單 RSI, positionId={current_position_id_global}, 新止損={new_stop_loss}, 新止盈={new_take_profit}, ATR={latest_atr}, RSI={latest_rsi}")
                     current_stop_loss_price = new_stop_loss
                 else:
                     log_event("RSI多單動態止損/止盈調整失敗", f"多單 RSI, positionId={current_position_id_global}, 嘗試新止損={new_stop_loss}, 新止盈={new_take_profit}, 錯誤={place_result}")
 
         # RSI 空單動態止盈止損自動更新（先查詢、取消、再設置）
         if current_pos_side == "short" and current_pos_entry_type == "rsi_short" and current_position_id_global:
-            new_stop_loss = latest_close + latest_atr * STOP_MULT
-            new_take_profit = latest_close - latest_atr * LIMIT_MULT
+            if current_entry_price_short is not None:
+                new_stop_loss = current_entry_price_short + latest_atr * STOP_MULT
+                new_take_profit = current_entry_price_short - latest_atr * LIMIT_MULT
+            else:
+                log_event("止損止盈錯誤", "無法取得空單開倉價，跳過動態止損止盈計算")
+                new_stop_loss = None
+                new_take_profit = None
             if (current_stop_loss_price is None or abs(new_stop_loss - current_stop_loss_price) > 1e-6):
                 tpsl_order_ids = get_pending_tpsl_orders(api_key, secret_key, symbol, current_position_id_global)
                 for oid in tpsl_order_ids:
                     cancel_tpsl_order(api_key, secret_key, symbol, oid)
                 place_result = place_conditional_orders(api_key, secret_key, symbol, margin_coin, current_position_id_global, stop_price=new_stop_loss, limit_price=new_take_profit)
                 if place_result and place_result.get('code') == 0:
-                    log_event("RSI空單動態止損/止盈調整", f"空單 RSI, positionId={current_position_id_global}, 新止損={new_stop_loss}, 新止盈={new_take_profit}")
+                    log_event("RSI空單動態止損/止盈調整", f"空單 RSI, positionId={current_position_id_global}, 新止損={new_stop_loss}, 新止盈={new_take_profit}, ATR={latest_atr}, RSI={latest_rsi}")
                     current_stop_loss_price = new_stop_loss
                 else:
                     log_event("RSI空單動態止損/止盈調整失敗", f"空單 RSI, positionId={current_position_id_global}, 嘗試新止損={new_stop_loss}, 新止盈={new_take_profit}, 錯誤={place_result}")
@@ -957,23 +1113,21 @@ def check_wallet_balance(api_key, secret_key):
         error_msg = f"執行交易策略時發生未知錯誤: {e}"
         print(f"錯誤：{error_msg}")
 
-# === 查詢持倉狀態 === #
-def get_current_position_details(api_key, secret_key, symbol, margin_coin=MARGIN_COIN): # 使用 MARGIN_COIN from config as default
-    """查詢目前持倉的詳細信息，包括方向、數量、positionId 和未實現盈虧。"""
+# === 查詢持倉狀態（新版：同時回傳多單與空單） === #
+def get_current_position_details(api_key, secret_key, symbol, margin_coin=MARGIN_COIN):
+    """
+    回傳 {'long': {...}, 'short': {...}} 結構，分別包含 qty, positionId, unrealized_pnl, avgOpenPrice。
+    """
     import hashlib, uuid, time, requests
-
     url = "https://fapi.bitunix.com/api/v1/futures/position/get_pending_positions"
     params = {"symbol": symbol}
     nonce = uuid.uuid4().hex
     timestamp = str(int(time.time() * 1000))
-    
     sorted_items = sorted((k, str(v)) for k, v in params.items())
     query_string = "".join(f"{k}{v}" for k, v in sorted_items)
-
     digest_input = nonce + timestamp + api_key + query_string
     digest = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
     sign = hashlib.sha256((digest + secret_key).encode('utf-8')).hexdigest()
-
     headers = {
         "api-key": api_key,
         "sign": sign,
@@ -981,6 +1135,7 @@ def get_current_position_details(api_key, secret_key, symbol, margin_coin=MARGIN
         "timestamp": timestamp,
         "Content-Type": "application/json"
     }
+    result = {"long": None, "short": None}
     try:
         res = requests.get(url, headers=headers, params=params)
         data = res.json()
@@ -988,20 +1143,17 @@ def get_current_position_details(api_key, secret_key, symbol, margin_coin=MARGIN
             for pos_detail in data["data"]:
                 pos_qty_str = pos_detail.get("qty", "0")
                 position_id = pos_detail.get("positionId")
-                unrealized_pnl = float(pos_detail.get("unrealizedPNL", 0.0)) # 獲取未實現盈虧
-                
-                if float(pos_qty_str) > 0: # 只處理有實際數量的倉位
+                unrealized_pnl = float(pos_detail.get("unrealizedPNL", 0.0))
+                avg_open_price = float(pos_detail.get("avgOpenPrice", 0.0)) if pos_detail.get("avgOpenPrice") else None
+                if float(pos_qty_str) > 0:
                     if pos_detail.get("side") == "BUY":
-                        print(f"API偵測到多單持倉: qty={pos_qty_str}, positionId={position_id}, PNL={unrealized_pnl}")
-                        return "long", pos_qty_str, position_id, unrealized_pnl
-                    if pos_detail.get("side") == "SELL":
-                        print(f"API偵測到空單持倉: qty={pos_qty_str}, positionId={position_id}, PNL={unrealized_pnl}")
-                        return "short", pos_qty_str, position_id, unrealized_pnl
-        # print("API未偵測到有效持倉或回傳數據格式問題。") # 可以根據需要取消註釋
-        return None, None, None, 0.0  # 無持倉或錯誤，PNL返回0.0
+                        result["long"] = {"qty": pos_qty_str, "positionId": position_id, "unrealized_pnl": unrealized_pnl, "avgOpenPrice": avg_open_price}
+                    elif pos_detail.get("side") == "SELL":
+                        result["short"] = {"qty": pos_qty_str, "positionId": position_id, "unrealized_pnl": unrealized_pnl, "avgOpenPrice": avg_open_price}
+        return result
     except Exception as e:
         print(f"查詢持倉詳細失敗: {e}")
-        return None, None, None, 0.0
+        return {"long": None, "short": None}
 
 def get_recent_closed_orders(api_key, secret_key, symbol, page_size=10):
     url = "https://fapi.bitunix.com/api/v1/futures/order/history"
@@ -1029,9 +1181,9 @@ def get_recent_closed_orders(api_key, secret_key, symbol, page_size=10):
         print(f"查詢歷史訂單失敗: {e}")
     return []
 # === 新增：查詢最近平倉訂單的輔助函數 ===
-def query_last_closed_order(api_key, secret_key, symbol, prev_pos_id):
+def query_last_closed_order(api_key, secret_key, symbol, prev_pos_id, max_retries=3, retry_interval=1):
     """
-    查詢最近的平倉訂單，並判斷是TP還是SL
+    查詢最近的平倉訂單，並判斷是TP還是SL，增加debug print與重試機制。
     """
     url = "https://fapi.bitunix.com/api/v1/futures/order/history"
     params = {"symbol": symbol, "pageSize": 5}
@@ -1049,19 +1201,21 @@ def query_last_closed_order(api_key, secret_key, symbol, prev_pos_id):
         "timestamp": timestamp,
         "Content-Type": "application/json"
     }
-    try:
-        res = requests.get(url, headers=headers, params=params)
-        data = res.json()
-        if data.get("code") == 0 and data.get("data"):
-            for order in data["data"]:
-                # 根據 positionId 或其他欄位比對
-                if str(order.get("positionId")) == str(prev_pos_id) and order.get("status") == "FILLED":
-                    trigger_type = order.get("triggerType", "")
-                    close_price = order.get("avgPrice", order.get("price", ""))
-                    profit = order.get("profit", 0)
-                    return {"trigger_type": trigger_type, "close_price": close_price, "profit": profit}
-    except Exception as e:
-        print(f"查詢歷史訂單失敗: {e}")
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(url, headers=headers, params=params)
+            data = res.json()
+            print(f"[DEBUG] 歷史訂單查詢結果 (第{attempt+1}次): {data}")
+            if data.get("code") == 0 and data.get("data"):
+                for order in data["data"]:
+                    if str(order.get("positionId")) == str(prev_pos_id) and order.get("status") == "FILLED":
+                        trigger_type = order.get("triggerType", "")
+                        close_price = order.get("avgPrice", order.get("price", ""))
+                        profit = order.get("profit", None)
+                        return {"trigger_type": trigger_type, "close_price": close_price, "profit": profit}
+        except Exception as e:
+            print(f"查詢歷史訂單失敗: {e}")
+        time.sleep(retry_interval)
     return None
 
 def send_profit_loss_to_discord(api_key, secret_key, symbol_param, message): # Renamed symbol to symbol_param
@@ -1170,250 +1324,280 @@ def cancel_tpsl_order(api_key, secret_key, symbol, order_id):
         print(f"取消 TP/SL 單失敗: {e}")
         return False
 
-def main():
-    global win_count, loss_count
-    global current_pos_entry_type, current_stop_loss_price, current_position_id_global, last_checked_kline_time
-    load_stats() # 啟動時載入統計數據
-    order_points = []  # 新增：初始化 order_points 以避免 NameError
+def set_leverage_to_config():
+    """
+    使用 Bitunix API 將槓桿設為 config.py 的 LEVERAGE
+    """
+    url = "https://fapi.bitunix.com/api/v1/futures/account/change_leverage"
+    body = {
+        "symbol": SYMBOL,
+        "leverage": LEVERAGE,
+        "marginCoin": MARGIN_COIN
+    }
+    import uuid, time, hashlib, json
+    nonce = uuid.uuid4().hex
+    timestamp = str(int(time.time() * 1000))
+    body_str = json.dumps(body, separators=(',', ':'), ensure_ascii=False)
+    digest_input = nonce + timestamp + BITUNIX_API_KEY + body_str
+    digest = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
+    sign = hashlib.sha256((digest + BITUNIX_SECRET_KEY).encode('utf-8')).hexdigest()
+    headers = {
+        "api-key": BITUNIX_API_KEY,
+        "sign": sign,
+        "nonce": nonce,
+        "timestamp": timestamp,
+        "language": "en-US",
+        "Content-Type": "application/json"
+    }
+    try:
+        res = requests.post(url, headers=headers, data=body_str)
+        print(f"[DEBUG] 槓桿設定API回應: {res.text}")
+        data = res.json()
+        if data.get("code") == 0:
+            print(f"[INFO] 槓桿已設為 {LEVERAGE}")
+        else:
+            print(f"[WARNING] 槓桿設定失敗: {data}")
+            log_event("槓桿設定失敗", str(data))
+    except Exception as e:
+        print(f"[ERROR] 設定槓桿時發生錯誤: {e}")
+        log_event("槓桿設定異常", str(e))
 
-    # 用戶參數
-    from config import TRADING_PAIR, SYMBOL, MARGIN_COIN, LEVERAGE, WALLET_PERCENTAGE, RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK, STOP_MULT, LIMIT_MULT, RSI_BUY, EXIT_RSI, ATR_MULT, TIMEFRAME
-    api_key = BITUNIX_API_KEY # 從 config 導入
-    secret_key = BITUNIX_SECRET_KEY # 從 config 導入
-    # trading_pair 變數不再需要在 main 中單獨定義，直接使用導入的 TRADING_PAIR 或 SYMBOL
-    symbol = SYMBOL # SYMBOL 已經從 config 導入
-    margin_coin = MARGIN_COIN # 從 config 導入
-    leverage = LEVERAGE
-    wallet_percentage = WALLET_PERCENTAGE
+class BitunixBot(discord.Client):
+    def __init__(self, **kwargs):
+        super().__init__(intents=discord.Intents.default())
+        self.position_message_id = None
+        self.last_position_status = None
+        self.bg_task = None
 
-    current_pos_side = None
-    current_pos_qty = None
-    # win_count 和 loss_count 由 load_stats() 初始化，此處無需重置為0
-    # win_count = 0
-    # loss_count = 0
-    last_upper_band = None
-    last_lower_band = None
-    last_middle_band = None
-    
-    print("交易機器人啟動，開始載入初始K線數據並準備生成啟動圖表...")
-    # 原啟動訊息已移除，將由包含圖表的訊息替代
+    async def on_ready(self):
+        print(f'Logged in as {self.user}')
+        self.bg_task = asyncio.create_task(self.trading_loop())
 
-    # 獲取初始K線數據用於繪圖
-    ohlcv_data = fetch_ohlcv(api_key, secret_key)
+    async def trading_loop(self):
+        global win_count, loss_count, current_pos_entry_type, current_stop_loss_price, current_position_id_global, last_checked_kline_time
+        load_stats()
+        from config import TRADING_PAIR, SYMBOL, MARGIN_COIN, LEVERAGE, WALLET_PERCENTAGE, RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK, STOP_MULT, LIMIT_MULT, RSI_BUY, EXIT_RSI, ATR_MULT, TIMEFRAME
+        api_key = BITUNIX_API_KEY
+        secret_key = BITUNIX_SECRET_KEY
+        symbol = SYMBOL
+        margin_coin = MARGIN_COIN
+        leverage = LEVERAGE
+        wallet_percentage = WALLET_PERCENTAGE
+        print("交易機器人啟動，開始載入初始K線數據...")
+        ohlcv_data = fetch_ohlcv(api_key, secret_key)
+        balance = check_wallet_balance(api_key, secret_key)
+        min_data_len = max(RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK + 1) + 5
+        if ohlcv_data is None or len(ohlcv_data) < min_data_len:
+            await self.send_status(f"🔴 啟動失敗：無法獲取足夠的初始K線數據。需要至少 {min_data_len} 條數據，實際獲取 {len(ohlcv_data) if ohlcv_data is not None else 0} 條。")
+            return
+        df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df_ind = compute_indicators(df, RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK, api_key, secret_key, symbol)
+        if df_ind is None or df_ind.empty or df_ind['rsi'].isnull().all() or df_ind['atr'].isnull().all():
+            await self.send_status("🔴 啟動失敗：計算指標失敗。")
+            return
+        latest_close = df_ind['close'].iloc[-1]
+        latest_rsi = df_ind['rsi'].iloc[-1]
+        latest_atr = df_ind['atr'].iloc[-1]
+        print(f"[Main Startup] 最新收盤價: {latest_close:.2f}, RSI: {latest_rsi:.2f}, ATR: {latest_atr:.4f}")
+        await self.send_status("", balance=balance, rsi=latest_rsi)
+        # 冷啟動時立即同步持倉訊息
+        # === 新增：手動補 entry_type ===
+        pos_info = get_current_position_details(api_key, secret_key, symbol, margin_coin)
+        for pos in [pos_info["long"], pos_info["short"]]:
+            if pos is not None:
+                pid = str(pos.get("positionId"))
+                if pid not in position_entry_type_map:
+                    print(f"偵測到未知進場方式的持倉：positionId={pid} 進場價={pos.get('avgOpenPrice')} 數量={pos.get('qty')}")
+                    entry_type = input(f"請輸入 positionId={pid} 的進場方式（RSI/Breakout）：").strip().upper()
+                    if entry_type in ["RSI", "BREAKOUT"]:
+                        position_entry_type_map[pid] = "RSI" if entry_type == "RSI" else "Breakout"
+                        save_position_entry_type_map()
+                        print(f"已補 entry_type: {pid} → {position_entry_type_map[pid]}")
+                    else:
+                        print("輸入無效，請下次重啟時再補。")
+        await self.update_discord_position_message(api_key, secret_key, symbol, margin_coin, latest_rsi, latest_atr)
+        while True:
+            ohlcv_data = fetch_ohlcv(api_key, secret_key)
+            df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df_ind = compute_indicators(df, RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK, api_key, secret_key, symbol)
+            latest_rsi = df_ind['rsi'].iloc[-1]
+            latest_atr = df_ind['atr'].iloc[-1]
+            execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_percentage, leverage, RSI_BUY, BREAKOUT_LOOKBACK, ATR_MULT)
+            await self.update_discord_position_message(api_key, secret_key, symbol, margin_coin, latest_rsi, latest_atr)
+            await asyncio.sleep(LOOP_INTERVAL_SECONDS)
 
-    # 新增：查詢目前錢包餘額
-    balance = check_wallet_balance(api_key, secret_key)
-
-    min_data_len = max(RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK + 1) + 5 # +1 for shift, +5 for buffer
-    if ohlcv_data is None or len(ohlcv_data) < min_data_len:
-        error_detail_msg = f"需要至少 {min_data_len} 條數據，實際獲取 {len(ohlcv_data) if ohlcv_data is not None else 0} 條。"
-        send_discord_message(f"🔴 啟動失敗：無法獲取足夠的初始K線數據繪製圖表。{error_detail_msg}", api_key, secret_key, operation_details={"type": "error", "details": f"Insufficient initial K-line data for chart. {error_detail_msg}", "force_send": True})
-        return
-
-    df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    # 可選擇截取最近一部分數據進行繪圖，避免過長的歷史數據影響圖表可讀性
-    # df = df.iloc[-min_data_len*2:] 
-
-    df_for_plot = compute_indicators(df.copy(), RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK, api_key, secret_key, symbol)
-    if df_for_plot is None or df_for_plot.empty:
-        send_discord_message("🔴 啟動失敗：計算初始指標失敗，無法繪製圖表。", api_key, secret_key, operation_details={"type": "error", "details": "Failed to compute initial indicators for chart", "force_send": True})
-        return
-
-    if df_for_plot['rsi'].isnull().all() or df_for_plot['atr'].isnull().all():
-        send_discord_message("🔴 啟動失敗：計算出的初始指標包含過多無效值 (NaN)，無法繪製圖表。", api_key, secret_key, operation_details={"type": "error", "details": "Computed initial indicators are mostly NaN, cannot plot chart.", "force_send": True})
-        return
-
-    latest_close = df_for_plot['close'].iloc[-1]
-    latest_rsi = df_for_plot['rsi'].iloc[-1]
-    latest_highest_break = df_for_plot['highest_break'].iloc[-1] if 'highest_break' in df_for_plot.columns and pd.notna(df_for_plot['highest_break'].iloc[-1]) else None
-    latest_atr = df_for_plot['atr'].iloc[-1]
-    
-    if pd.isna(latest_close) or pd.isna(latest_rsi) or pd.isna(latest_atr):
-        send_discord_message("🔴 啟動失敗：獲取的最新指標數據包含無效值 (NaN)，無法繪製圖表。", api_key, secret_key, operation_details={"type": "error", "details": "Latest indicator data contains NaN, cannot plot chart.", "force_send": True})
-        return
-
-    print(f"[Main Startup] 準備繪製啟動圖表... 最新收盤價: {latest_close:.2f}, RSI: {latest_rsi:.2f}, ATR: {latest_atr:.4f}")
-    # 使用 df_for_plot 進行繪圖
-    send_discord_message(f"🚀 交易機器人啟動 🚀\n策略參數:\nSTOP_MULT: {STOP_MULT}\nLIMIT_MULT: {LIMIT_MULT}\nRSI_BUY: {RSI_BUY}\nRSI_LEN: {RSI_LEN}\nEXIT_RSI: {EXIT_RSI}\nrsiSell: {rsiSell}（空單進場RSI）\nexitRSI_short: {exitRSI_short}（空單平倉RSI）\nBREAKOUT_LOOKBACK: {BREAKOUT_LOOKBACK}\nATR_LEN: {ATR_LEN}\nATR_MULT: {ATR_MULT}\nTIMEFRAME: {TIMEFRAME}\nWALLET_PERCENTAGE: {wallet_percentage}（每次下單佔錢包比例）\nLOOP_INTERVAL_SECONDS: {LOOP_INTERVAL_SECONDS}（主循環間隔秒數）\n**目前錢包餘額: {balance:.2f} USDT**\n\n**最新 RSI: {latest_rsi:.2f}**", api_key, secret_key, operation_details={"type": "custom_message", "force_send": True})
-
-    last_kline_len = len(ohlcv_data)
-
-    # 在主循環開始前，獲取一次當前持倉狀態 (返回四個值)
-    current_pos_side, current_pos_qty_str, current_pos_id, current_unrealized_pnl = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
-    print(f"啟動時持倉狀態: side={current_pos_side}, qty={current_pos_qty_str}, positionId={current_pos_id}, PNL={current_unrealized_pnl}")
-    
-    # 啟動時自動補上現有持倉點 (這部分邏輯如果存在，需要確保 order_points 的更新)
-    import numpy as np
-    from typing import Any
-    def get_entry_price_and_side(api_key: str, secret_key: str, symbol: str) -> Any:
-        url = "https://fapi.bitunix.com/api/v1/futures/position/get_pending_positions"
-        params = {"symbol": symbol}
-        nonce = uuid.uuid4().hex
-        timestamp = str(int(time.time() * 1000))
-        api_key_ = api_key
-        secret_key_ = secret_key
-        sorted_items = sorted((k, str(v)) for k, v in params.items())
-        query_string = "".join(f"{k}{v}" for k, v in sorted_items)
-        digest_input = nonce + timestamp + api_key_ + query_string
-        digest = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
-        sign = hashlib.sha256((digest + secret_key_).encode('utf-8')).hexdigest()
-        headers = {
-            "api-key": api_key_,
-            "sign": sign,
-            "nonce": nonce,
-            "timestamp": timestamp,
-            "Content-Type": "application/json"
-        }
+    async def send_status(self, msg, balance=None, rsi=None):
         try:
-            res = requests.get(url, headers=headers, params=params)
-            data = res.json()
-            if data.get("code") == 0 and data.get("data"):
-                for pos in data["data"]:
-                    side = None
-                    if pos.get("side") == "BUY" and float(pos.get("qty", 0)) > 0:
-                        side = "long"
-                    elif pos.get("side") == "SELL" and float(pos.get("qty", 0)) > 0:
-                        side = "short"
-                    if side:
-                        entry_price = float(pos.get("avgOpenPrice", pos.get("entryValue", 0)))
-                        return entry_price, side
-            return None
+            from config import STOP_MULT, LIMIT_MULT, RSI_BUY, RSI_LEN, EXIT_RSI, rsiSell, exitRSI_short, BREAKOUT_LOOKBACK, ATR_LEN, ATR_MULT, TIMEFRAME, WALLET_PERCENTAGE, LOOP_INTERVAL_SECONDS
+            channel = self.get_channel(DISCORD_CHANNEL_ID)
+            if channel:
+                now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+                param_text = (
+                    f"STOP_MULT: {STOP_MULT}\n"
+                    f"LIMIT_MULT: {LIMIT_MULT}\n"
+                    f"RSI_BUY: {RSI_BUY}\n"
+                    f"RSI_LEN: {RSI_LEN}\n"
+                    f"EXIT_RSI: {EXIT_RSI}\n"
+                    f"rsiSell: {rsiSell}\n"
+                    f"exitRSI_short: {exitRSI_short}\n"
+                    f"BREAKOUT_LOOKBACK: {BREAKOUT_LOOKBACK}\n"
+                    f"ATR_LEN: {ATR_LEN}\n"
+                    f"ATR_MULT: {ATR_MULT}\n"
+                    f"TIMEFRAME: {TIMEFRAME}\n"
+                    f"WALLET_PERCENTAGE: {WALLET_PERCENTAGE}\n"
+                    f"LOOP_INTERVAL_SECONDS: {LOOP_INTERVAL_SECONDS}\n"
+                )
+                embed = discord.Embed(
+                    title="🚀 交易機器人啟動 🚀",
+                    description=(
+                        f"```{param_text}```"
+                        f"目前錢包餘額: `{balance:.2f} USDT`\n"
+                        f"最新 RSI: `{rsi:.2f}`\n"
+                        f"🕒 啟動時間: {now_str}"
+                    ),
+                    color=0x3498db
+                )
+                await channel.send(embed=embed)
         except Exception as e:
-            print(f"查詢持倉失敗: {e}")
-            return None
+            print(f"send_status 發生錯誤: {e}")
+            logger.error(f"send_status 發生錯誤: {e}\n{traceback.format_exc()}")
 
-    entry = get_entry_price_and_side(api_key, secret_key, symbol)
-    if entry:
-        entry_price, side = entry
-        # 使用 df_for_plot 中的 'close' 數據
-        close_prices = df_for_plot['close'].values
-        idx = int(np.argmin(np.abs(close_prices - entry_price)))
-        order_points.append({'idx': idx, 'price': close_prices[idx], 'side': side})
-        print(f"DEBUG: 啟動自動補標註現有持倉點: {order_points[-1]}")
-
-    global last_checked_kline_time
-    last_checked_kline_time = df['timestamp'].iloc[-1]
-
-    # === 新增：持倉消失自動偵測與條件單觸發通知 ===
-    last_cycle_pos_side = None
-    last_cycle_pos_id = None
-    last_cycle_entry_price = None
-    
-    # === 冷啟動自動補發未通知的條件單平倉通知 ===
-    notified_ids = load_notified_order_ids()
-    current_pos_side, current_pos_qty_str, current_pos_id, _ = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
-    recent_orders = get_recent_closed_orders(api_key, secret_key, SYMBOL, page_size=10)
-    new_notify = False
-    if current_pos_side is None:
-        for order in recent_orders:
-            order_id = str(order.get("orderId"))
-            if order_id not in notified_ids and order.get("status") == "FILLED":
-                trigger_type = order.get("triggerType", "")
-                close_price = order.get("avgPrice", order.get("price", ""))
-                profit = order.get("profit", 0)
-                pos_side = "long" if order.get("side") == "BUY" else "short"
-                if trigger_type == "TAKE_PROFIT":
-                    msg = f"🟢 **止盈觸發自動平倉**\n平倉價格：{close_price}\n本次盈虧：{profit} USDT"
-                    log_event("止盈觸發(冷啟動)", msg)
-                    send_discord_message(msg, api_key, secret_key, operation_details={"type": "close_success", "side_closed": pos_side, "pnl": profit, "force_send": True})
-                elif trigger_type == "STOP_LOSS":
-                    msg = f"🔴 **止損觸發自動平倉**\n平倉價格：{close_price}\n本次盈虧：{profit} USDT"
-                    log_event("止損觸發(冷啟動)", msg)
-                    send_discord_message(msg, api_key, secret_key, operation_details={"type": "close_success", "side_closed": pos_side, "pnl": profit, "force_send": True})
-                else:
-                    msg = f"⚠️ **自動平倉（未知觸發類型）**\n平倉價格：{close_price}\n本次盈虧：{profit} USDT"
-                    log_event("自動平倉(冷啟動)", msg)
-                    send_discord_message(msg, api_key, secret_key, operation_details={"type": "close_success", "side_closed": pos_side, "pnl": profit, "force_send": True})
-                notified_ids.append(order_id)
-                new_notify = True
-    if new_notify:
-        save_notified_order_ids(notified_ids)
-
-    # === 冷啟動自動還原全域狀態 ===
-    current_position_id_global = current_pos_id
-    # 取得最新K線與ATR
-    ohlcv_data = fetch_ohlcv(api_key, secret_key)
-    df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    last_checked_kline_time = df['timestamp'].iloc[-1]
-    latest_close = df['close'].iloc[-1]
-    # 重新計算ATR
-    df_ind = compute_indicators(df, RSI_LEN, ATR_LEN, BREAKOUT_LOOKBACK, api_key, secret_key, symbol)
-    latest_atr = df_ind['atr'].iloc[-1] if 'atr' in df_ind.columns else 0
-    # 根據持倉自動還原狀態
-    if current_pos_side == "long":
-        # 預設為 rsi 進場（如需更精細可根據進場價格與策略判斷）
-        current_pos_entry_type = "rsi"
-        current_stop_loss_price = latest_close - latest_atr * STOP_MULT
-    elif current_pos_side == "short":
-        current_pos_entry_type = "rsi_short"
-        current_stop_loss_price = latest_close + latest_atr * STOP_MULT
-    else:
-        current_pos_entry_type = None
-        current_stop_loss_price = None
-        current_position_id_global = None
-
-    while True:
-        # 檢查錢包餘額並獲取當前餘額
-        balance = check_wallet_balance(api_key, secret_key)
-        # 計算下單數量 (錢包餘額的30%*槓桿/當前BTC價格)
-        btc_price = None
-        # 執行交易策略
-        execute_trading_strategy(api_key, secret_key, symbol, margin_coin, wallet_percentage, leverage, RSI_BUY, BREAKOUT_LOOKBACK, ATR_MULT)
-
-        # === 新增：持倉消失自動偵測 ===
-        prev_pos_side = last_cycle_pos_side
-        prev_pos_id = last_cycle_pos_id
-        prev_entry_price = last_cycle_entry_price
-        # 查詢本輪持倉
-        current_pos_side, current_pos_qty_str, current_pos_id, _ = get_current_position_details(api_key, secret_key, SYMBOL, MARGIN_COIN)
-        # 檢查上一輪有持倉，這一輪沒持倉
-        if prev_pos_side in ["long", "short"] and current_pos_side is None and prev_pos_id:
-            result = query_last_closed_order(api_key, secret_key, SYMBOL, prev_pos_id)
-            if result:
-                trigger_type, close_price, profit = result["trigger_type"], result["close_price"], result["profit"]
-                if trigger_type == "TAKE_PROFIT":
-                    msg = f"🟢 **止盈觸發自動平倉**\n平倉價格：{close_price}\n本次盈虧：{profit} USDT"
-                    log_event("止盈觸發", msg)
-                    send_discord_message(msg, api_key, secret_key, operation_details={"type": "close_success", "side_closed": prev_pos_side, "pnl": profit, "force_send": True})
-                elif trigger_type == "STOP_LOSS":
-                    msg = f"🔴 **止損觸發自動平倉**\n平倉價格：{close_price}\n本次盈虧：{profit} USDT"
-                    log_event("止損觸發", msg)
-                    send_discord_message(msg, api_key, secret_key, operation_details={"type": "close_success", "side_closed": prev_pos_side, "pnl": profit, "force_send": True})
-                else:
-                    msg = f"⚠️ **自動平倉（未知觸發類型）**\n平倉價格：{close_price}\n本次盈虧：{profit} USDT"
-                    log_event("自動平倉", msg)
-                    send_discord_message(msg, api_key, secret_key, operation_details={"type": "close_success", "side_closed": prev_pos_side, "pnl": profit, "force_send": True})
-        # 更新本輪持倉狀態
-        last_cycle_pos_side = current_pos_side
-        last_cycle_pos_id = current_pos_id
-        last_cycle_entry_price = None  # 如需可查詢 entry price
-
-        # 計算下單數量 (錢包餘額的30%*槓桿/當前BTC價格)
-        btc_price = None
-        # 檢查錢包餘額並獲取當前餘額 (用於下一次循環的數量計算)
-        balance = check_wallet_balance(api_key, secret_key)
-        if balance is None or balance <= 0:
-            print("餘額為0或無法獲取餘額，退出程序")
-            send_discord_message("🛑 **程序終止**: 餘額為0或無法獲取餘額，交易機器人已停止運行 🛑", SYMBOL, api_key, secret_key)
-            # 在退出前強制發送所有緩衝區中的消息
-            flush_discord_messages()
-            print("程序已終止運行")
-            return # 直接退出main函數而不是繼續循環
-
-        # 休眠1分鐘後再次執行策略
-        # 休眠指定時間後再次執行策略
-        next_strategy_time = time.strftime('%H:%M:%S', time.localtime(time.time() + LOOP_INTERVAL_SECONDS))
-        print(f"休眠中，將在 {next_strategy_time} 再次執行交易策略 (間隔 {LOOP_INTERVAL_SECONDS} 秒)...")
-        # 在休眠前強制發送所有緩衝區中的消息
-        flush_discord_messages()
-        time.sleep(LOOP_INTERVAL_SECONDS) # 休眠1分鐘  # 每 1 分鐘檢查一次
-
+    async def update_discord_position_message(self, api_key, secret_key, symbol, margin_coin, latest_rsi, latest_atr):
+        try:
+            from config import WALLET_PERCENTAGE  # 確保變數可用
+            channel = self.get_channel(DISCORD_CHANNEL_ID)
+            if not channel:
+                print("找不到指定的 Discord 頻道")
+                logger.error("找不到指定的 Discord 頻道")
+                return
+            pos_info = get_current_position_details(api_key, secret_key, symbol, margin_coin)
+            long_pos = pos_info["long"]
+            short_pos = pos_info["short"]
+            now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+            rsi_str = f"{latest_rsi:.2f}" if latest_rsi is not None else "N/A"
+            # Embed 標題與顏色
+            embed_title = f"{SYMBOL} 交易通知"
+            embed_color = 0x3498db  # 預設藍色
+            show_param = False
+            if long_pos or short_pos:
+                embed_color = 0x2ecc71  # 綠色（有持倉）
+                show_param = False
+            else:
+                embed_color = 0xf1c40f  # 黃色（無持倉）
+                show_param = True
+            # Embed 內容
+            if show_param:
+                param_text = (
+                    f"STOP_MULT: {STOP_MULT}\n"
+                    f"LIMIT_MULT: {LIMIT_MULT}\n"
+                    f"RSI_BUY: {RSI_BUY}\n"
+                    f"RSI_LEN: {RSI_LEN}\n"
+                    f"EXIT_RSI: {EXIT_RSI}\n"
+                    f"rsiSell: {rsiSell}\n"
+                    f"exitRSI_short: {exitRSI_short}\n"
+                    f"BREAKOUT_LOOKBACK: {BREAKOUT_LOOKBACK}\n"
+                    f"ATR_LEN: {ATR_LEN}\n"
+                    f"ATR_MULT: {ATR_MULT}\n"
+                    f"TIMEFRAME: {TIMEFRAME}\n"
+                    f"WALLET_PERCENTAGE: {WALLET_PERCENTAGE}\n"
+                    f"LOOP_INTERVAL_SECONDS: {LOOP_INTERVAL_SECONDS}\n"
+                    f"目前錢包餘額: {check_wallet_balance(api_key, secret_key):.2f} USDT\n"
+                )
+                embed = discord.Embed(
+                    title=embed_title,
+                    description=f"🚀 交易機器人啟動 🚀\n```\n{param_text}```\n**最新 RSI:** `{rsi_str}`",
+                    color=embed_color
+                )
+            else:
+                embed = discord.Embed(
+                    title=embed_title,
+                    description=f"**最新 RSI:** `{rsi_str}`",
+                    color=embed_color
+                )
+            # 勝率
+            total_trades = win_count + loss_count
+            win_rate_str = f"{win_count / total_trades * 100:.2f}% ({win_count}勝/{loss_count}負)" if total_trades > 0 else "N/A(尚無已完成交易)"
+            embed.add_field(name="🏆 勝率統計", value=win_rate_str, inline=True)
+            # 持倉與盈虧
+            if long_pos is not None:
+                entry_type = position_entry_type_map.get(str(long_pos.get("positionId")), "未知")
+                entry_price = long_pos.get("avgOpenPrice")
+                stop_loss = None
+                take_profit = None
+                if entry_type == "RSI" and entry_price is not None:
+                    stop_loss = entry_price - latest_atr * STOP_MULT
+                    take_profit = entry_price + latest_atr * LIMIT_MULT
+                elif entry_type == "Breakout" and entry_price is not None:
+                    stop_loss = long_pos.get("stop_loss") or (entry_price - latest_atr * ATR_MULT)
+                pnl = long_pos.get("unrealized_pnl")
+                entry_price_str = f"{entry_price:.2f}" if entry_price is not None else "N/A"
+                stop_loss_str = f"{stop_loss:.2f}" if stop_loss is not None else "N/A"
+                take_profit_str = f"{take_profit:.2f}" if take_profit is not None else "N/A"
+                pnl_str = f"{pnl:.2f}" if pnl is not None else "N/A"
+                embed.add_field(name="📊 目前持倉", value=f"多單 (數量: `{long_pos['qty']}`)", inline=True)
+                embed.add_field(name="💰 未實現盈虧", value=f"`{pnl_str} USDT`", inline=True)
+                embed.add_field(name="🔑 進場方式", value=f"{entry_type}", inline=True)
+                embed.add_field(name="💵 進場價", value=f"`{entry_price_str}`", inline=True)
+                embed.add_field(name="🛡️ 止損", value=f"`{stop_loss_str}`", inline=True)
+                embed.add_field(name="🎯 止盈", value=f"`{take_profit_str}`", inline=True)
+            elif short_pos is not None:
+                entry_type = position_entry_type_map.get(str(short_pos.get("positionId")), "未知")
+                entry_price = short_pos.get("avgOpenPrice")
+                stop_loss = None
+                take_profit = None
+                if entry_type == "RSI" and entry_price is not None:
+                    stop_loss = entry_price + latest_atr * STOP_MULT
+                    take_profit = entry_price - latest_atr * LIMIT_MULT
+                elif entry_type == "Breakout" and entry_price is not None:
+                    stop_loss = short_pos.get("stop_loss") or (entry_price + latest_atr * ATR_MULT)
+                pnl = short_pos.get("unrealized_pnl")
+                entry_price_str = f"{entry_price:.2f}" if entry_price is not None else "N/A"
+                stop_loss_str = f"{stop_loss:.2f}" if stop_loss is not None else "N/A"
+                take_profit_str = f"{take_profit:.2f}" if take_profit is not None else "N/A"
+                pnl_str = f"{pnl:.2f}" if pnl is not None else "N/A"
+                embed.add_field(name="📊 目前持倉", value=f"空單 (數量: `{short_pos['qty']}`)", inline=True)
+                embed.add_field(name="💰 未實現盈虧", value=f"`{pnl_str} USDT`", inline=True)
+                embed.add_field(name="🔑 進場方式", value=f"{entry_type}", inline=True)
+                embed.add_field(name="💵 進場價", value=f"`{entry_price_str}`", inline=True)
+                embed.add_field(name="🛡️ 止損", value=f"`{stop_loss_str}`", inline=True)
+                embed.add_field(name="🎯 止盈", value=f"`{take_profit_str}`", inline=True)
+            else:
+                embed.add_field(name="📊 目前持倉", value="無持倉", inline=True)
+                embed.add_field(name="💰 未實現盈虧", value="N/A", inline=True)
+            # 時間
+            embed.add_field(name="🕒 時間", value=now_str, inline=False)
+            # 發送或編輯訊息
+            if not self.position_message_id:
+                msg_obj = await channel.send(embed=embed)
+                self.position_message_id = msg_obj.id
+            else:
+                try:
+                    msg_obj = await channel.fetch_message(self.position_message_id)
+                    await msg_obj.edit(embed=embed)
+                except Exception as e:
+                    print(f"編輯訊息失敗: {e}，改為發送新訊息")
+                    logger.error(f"編輯訊息失敗: {e}\n{traceback.format_exc()}")
+                    msg_obj = await channel.send(embed=embed)
+                    self.position_message_id = msg_obj.id
+        except Exception as e:
+            print(f"update_discord_position_message 發生錯誤: {e}")
+            logger.error(f"update_discord_position_message 發生錯誤: {e}\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        # 確保程序結束時發送所有緩衝區中的消息
-        flush_discord_messages()
+    while True:
+        try:
+            print("主循環執行中...")
+            logger.info("主循環執行中...")
+            bot = BitunixBot()
+            bot.run(DISCORD_BOT_TOKEN)
+            break  # 成功啟動就跳出
+        except Exception as e:
+            print(f"啟動 Discord Bot 失敗：{e}")
+            logger.error(f"啟動 Discord Bot 失敗：{e}\n{traceback.format_exc()}")
+            print("3 秒後自動重試...")
+            import time
+            time.sleep(3)
+        finally:
+            flush_discord_messages()
