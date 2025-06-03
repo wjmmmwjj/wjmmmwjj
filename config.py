@@ -23,3 +23,5 @@ rsiSell = 53  # RSI 空單進場閾值
 exitRSI_short = 51  # RSI 空單平倉閾值
 CONDITIONAL_ORDER_MAX_RETRIES = 3  # 條件單自動重試最大次數
 CONDITIONAL_ORDER_RETRY_INTERVAL = 2  # 條件單重試間隔（秒）
+DISCORD_BOT_TOKEN = ""
+DISCORD_CHANNEL_ID =  # 請填入你的 Discord 頻道ID（整數）
